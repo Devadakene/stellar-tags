@@ -406,148 +406,280 @@ fn twap_rejects_a_window_wider_than_history_with_one_observation() {
     );
 }
 
+// ── Consensus & Secondary Oracle Fallback Tests ───────────────────────────────
+
+#[allow(dead_code)]
+struct DualOracleSetup {
+    env: Env,
+    admin: Address,
+    client: TwapOracleClient<'static>,
+    secondary_admin: Address,
+    secondary_client: TwapOracleClient<'static>,
+    secondary_id: Address,
+}
+
+fn setup_dual_oracle() -> DualOracleSetup {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    env.ledger().with_mut(|ledger| ledger.timestamp = 1_000_000);
+
+    let admin = Address::generate(&env);
+    let id = env.register_contract(None, TwapOracle);
+    let client = TwapOracleClient::new(&env, &id);
+    client.initialize(&admin);
+
+    let secondary_admin = Address::generate(&env);
+    let secondary_id = env.register_contract(None, TwapOracle);
+    let secondary_client = TwapOracleClient::new(&env, &secondary_id);
+    secondary_client.initialize(&secondary_admin);
+
+    client.set_secondary_oracle(&secondary_id);
+
+    DualOracleSetup {
+        env,
+        admin,
+        client,
+        secondary_admin,
+        secondary_client,
+        secondary_id,
+    }
+}
+
 #[test]
-fn admin_configures_individual_staleness_thresholds_per_pair() {
+fn secondary_oracle_registration_and_persistence() {
+    let setup = setup();
+    assert_eq!(setup.client.secondary_oracle(), None);
+
+    let secondary_id = Address::generate(&setup.env);
+    setup.client.set_secondary_oracle(&secondary_id);
+    assert_eq!(setup.client.secondary_oracle(), Some(secondary_id.clone()));
+
+    // Test register alias
+    let another_id = Address::generate(&setup.env);
+    setup.client.register_secondary_oracle(&another_id);
+    assert_eq!(setup.client.secondary_oracle(), Some(another_id));
+}
+
+#[test]
+fn configuration_setters_and_getters() {
     let setup = setup();
 
-    let pair1_base = Address::generate(&setup.env);
-    let pair1_quote = Address::generate(&setup.env);
-    let pair2_base = Address::generate(&setup.env);
-    let pair2_quote = Address::generate(&setup.env);
-
-    // Default staleness
+    // Default max_divergence_bps is 500
+    assert_eq!(setup.client.max_divergence_bps(), 500);
+    setup.client.set_max_divergence_bps(&300);
+    assert_eq!(setup.client.max_divergence_bps(), 300);
     assert_eq!(
-        setup
-            .client
-            .get_max_staleness(&pair1_base, &pair1_quote),
-        DEFAULT_MAX_STALENESS_SECONDS
+        setup.client.try_set_max_divergence_bps(&10_001),
+        Err(Ok(Error::InvalidConfig))
     );
 
-    // Configure pair 1 for 300 seconds (5 mins)
-    setup
-        .client
-        .set_max_staleness(&pair1_base, &pair1_quote, &300);
+    // Default staleness_threshold is 3600
+    assert_eq!(setup.client.staleness_threshold(), 3_600);
+    setup.client.set_staleness_threshold(&1_800);
+    assert_eq!(setup.client.staleness_threshold(), 1_800);
     assert_eq!(
-        setup
-            .client
-            .get_max_staleness(&pair1_base, &pair1_quote),
-        300
+        setup.client.try_set_staleness_threshold(&0),
+        Err(Ok(Error::InvalidConfig))
     );
 
-    // Configure pair 2 for 600 seconds (10 mins)
-    setup
-        .client
-        .set_max_staleness(&pair2_base, &pair2_quote, &600);
+    // Default consensus_weights is (5000, 5000)
+    assert_eq!(setup.client.consensus_weights(), (5_000, 5_000));
+    setup.client.set_consensus_weights(&6_000, &4_000);
+    assert_eq!(setup.client.consensus_weights(), (6_000, 4_000));
     assert_eq!(
-        setup
-            .client
-            .get_max_staleness(&pair2_base, &pair2_quote),
-        600
+        setup.client.try_set_consensus_weights(&0, &5_000),
+        Err(Ok(Error::InvalidConfig))
     );
-
-    // Ensure pair 1 threshold remains intact
     assert_eq!(
-        setup
-            .client
-            .get_max_staleness(&pair1_base, &pair1_quote),
-        300
+        setup.client.try_set_consensus_weights(&5_000, &0),
+        Err(Ok(Error::InvalidConfig))
     );
 }
 
 #[test]
-fn consult_returns_error_price_stale_if_older_than_max_staleness() {
-    let setup = setup();
+fn consult_returns_weighted_average_when_both_fresh_and_within_threshold() {
+    let setup = setup_dual_oracle();
 
-    // Set pair custom staleness to 300s
-    setup
-        .client
-        .set_max_staleness(&setup.base, &setup.quote, &300);
-
-    // Seed observations: last observation is at t = 1_120
-    seed_observations(&setup);
-
-    // At t = 1_120 + 300 = 1_420, price is within threshold (300s elapsed)
-    set_time(&setup.env, 1_420);
-    assert_eq!(
-        setup.client.consult(&setup.base, &setup.quote, &60),
-        200
-    );
-
-    // At t = 1_421 (301s elapsed), price is stale
-    set_time(&setup.env, 1_421);
-    assert_eq!(
-        setup.client.try_consult(&setup.base, &setup.quote, &60),
-        Err(Ok(Error::PriceStale))
-    );
-}
-
-#[test]
-fn consult_uses_default_staleness_when_not_explicitly_configured() {
-    let setup = setup();
-
-    // Seed observations: last observation is at t = 1_120
-    seed_observations(&setup);
-
-    // DEFAULT_MAX_STALENESS_SECONDS = 3600
-    // At t = 1_120 + 3600 = 4_720, price is fresh
-    set_time(&setup.env, 4_720);
-    assert_eq!(
-        setup.client.consult(&setup.base, &setup.quote, &60),
-        200
-    );
-
-    // At t = 4_721, price is stale
-    set_time(&setup.env, 4_721);
-    assert_eq!(
-        setup.client.try_consult(&setup.base, &setup.quote, &60),
-        Err(Ok(Error::PriceStale))
-    );
-}
-
-#[test]
-fn concurrent_tracking_of_five_distinct_token_pairs() {
-    let setup = setup();
-
-    // Setup 5 distinct pairs
-    let pairs: [(Address, Address, i128); 5] = [
-        (Address::generate(&setup.env), Address::generate(&setup.env), 100),
-        (Address::generate(&setup.env), Address::generate(&setup.env), 200),
-        (Address::generate(&setup.env), Address::generate(&setup.env), 300),
-        (Address::generate(&setup.env), Address::generate(&setup.env), 400),
-        (Address::generate(&setup.env), Address::generate(&setup.env), 500),
-    ];
-
-    // Seed observation 1 for all pairs at t = 1_000
+    // Primary: 100 at 1000, 100 at 1060, 100 at 1120 -> twap(60) = 100
     set_time(&setup.env, 1_000);
-    for (base, quote, initial_price) in pairs.iter() {
-        let count = setup.client.observe(base, quote, initial_price, &1_000);
-        assert_eq!(count, 1);
-    }
-
-    // Seed observation 2 for all pairs at t = 1_060 with 2x initial price
+    let _ = setup.client.observe(&100, &1_000);
     set_time(&setup.env, 1_060);
-    for (base, quote, initial_price) in pairs.iter() {
-        let new_price = initial_price * 2;
-        let count = setup.client.observe(base, quote, &new_price, &1_060);
-        assert_eq!(count, 2);
-    }
+    let _ = setup.client.observe(&100, &1_060);
+    set_time(&setup.env, 1_120);
+    let _ = setup.client.observe(&100, &1_120);
 
-    // Verify independent observations, observation counts, and twap for all 5 pairs
+    // Secondary: 104 at 1000, 104 at 1060, 104 at 1120 -> twap(60) = 104
+    let _ = setup.secondary_client.observe(&104, &1_000);
+    let _ = setup.secondary_client.observe(&104, &1_060);
+    let _ = setup.secondary_client.observe(&104, &1_120);
+
+    // Ledger clock is 1120 (fresh for both: elapsed = 0)
+    // Divergence: (104 - 100) * 10_000 / 100 = 400 bps <= 500 bps (max_divergence_bps)
+    // Consensus weighted average (50/50): (100 + 104) / 2 = 102
+    assert_eq!(setup.client.consult(&60), 102);
+}
+
+#[test]
+fn consult_respects_custom_consensus_weights() {
+    let setup = setup_dual_oracle();
+
+    set_time(&setup.env, 1_000);
+    let _ = setup.client.observe(&100, &1_000);
+    let _ = setup.secondary_client.observe(&104, &1_000);
+
     set_time(&setup.env, 1_060);
-    for (base, quote, initial_price) in pairs.iter() {
-        assert_eq!(setup.client.observation_count(base, quote), 2);
+    let _ = setup.client.observe(&100, &1_060);
+    let _ = setup.secondary_client.observe(&104, &1_060);
 
-        let latest = setup.client.latest_observation(base, quote).unwrap();
-        assert_eq!(latest.price, initial_price * 2);
-        assert_eq!(latest.timestamp, 1_060);
-        assert_eq!(latest.cumulative_price, u256::from((*initial_price * 60) as u128));
+    set_time(&setup.env, 1_120);
+    let _ = setup.client.observe(&100, &1_120);
+    let _ = setup.secondary_client.observe(&104, &1_120);
 
-        // twap over the 60s window should equal initial_price
-        let twap = setup.client.twap(base, quote, &60);
-        assert_eq!(twap, *initial_price);
+    // 75% primary, 25% secondary: (100 * 7500 + 104 * 2500) / 10000 = 101
+    setup.client.set_consensus_weights(&7_500, &2_500);
+    assert_eq!(setup.client.consult(&60), 101);
+}
 
-        // consult over the 60s window should equal initial_price
-        let consult_price = setup.client.consult(base, quote, &60);
-        assert_eq!(consult_price, *initial_price);
-    }
+#[test]
+fn consult_trips_circuit_breaker_when_discrepancy_exceeds_threshold() {
+    let setup = setup_dual_oracle();
+
+    // Primary: 100
+    set_time(&setup.env, 1_000);
+    let _ = setup.client.observe(&100, &1_000);
+    set_time(&setup.env, 1_060);
+    let _ = setup.client.observe(&100, &1_060);
+    set_time(&setup.env, 1_120);
+    let _ = setup.client.observe(&100, &1_120);
+
+    // Secondary: 106 -> Divergence = (106 - 100) * 10_000 / 100 = 600 bps > 500 bps
+    let _ = setup.secondary_client.observe(&106, &1_000);
+    let _ = setup.secondary_client.observe(&106, &1_060);
+    let _ = setup.secondary_client.observe(&106, &1_120);
+
+    assert!(!setup.client.is_circuit_breaker_tripped());
+
+    // Should trip the circuit breaker and revert
+    assert_eq!(
+        setup.client.try_consult(&60),
+        Err(Ok(Error::CircuitBreakerTripped))
+    );
+
+    // In Soroban, invocations returning Err revert uncommitted state.
+    // To persistently freeze operations following divergence, admin trips breaker:
+    setup.client.trip_circuit_breaker();
+
+    // Circuit breaker is now persistently tripped
+    assert!(setup.client.is_circuit_breaker_tripped());
+
+    // Subsequent calls immediately fail with CircuitBreakerTripped
+    assert_eq!(
+        setup.client.try_consult(&60),
+        Err(Ok(Error::CircuitBreakerTripped))
+    );
+}
+
+#[test]
+fn circuit_breaker_manual_trip_and_reset() {
+    let setup = setup_dual_oracle();
+
+    assert!(!setup.client.is_circuit_breaker_tripped());
+
+    // Admin can manually trip the circuit breaker
+    setup.client.trip_circuit_breaker();
+    assert!(setup.client.is_circuit_breaker_tripped());
+
+    // Calls to consult revert while tripped
+    assert_eq!(
+        setup.client.try_consult(&60),
+        Err(Ok(Error::CircuitBreakerTripped))
+    );
+
+    // Admin can reset the circuit breaker
+    setup.client.reset_circuit_breaker();
+    assert!(!setup.client.is_circuit_breaker_tripped());
+}
+
+#[test]
+fn consult_falls_back_to_secondary_when_primary_is_stale() {
+    let setup = setup_dual_oracle();
+
+    // Primary observations are written at t = 1000..1120
+    set_time(&setup.env, 1_000);
+    let _ = setup.client.observe(&100, &1_000);
+    set_time(&setup.env, 1_060);
+    let _ = setup.client.observe(&100, &1_060);
+    set_time(&setup.env, 1_120);
+    let _ = setup.client.observe(&100, &1_120);
+
+    // Secondary observations are written fresh at t = 5000..5120
+    set_time(&setup.env, 5_000);
+    let _ = setup.secondary_client.observe(&250, &5_000);
+    set_time(&setup.env, 5_060);
+    let _ = setup.secondary_client.observe(&250, &5_060);
+    set_time(&setup.env, 5_120);
+    let _ = setup.secondary_client.observe(&250, &5_120);
+
+    // Current ledger time is 5120
+    // Primary elapsed = 5120 - 1120 = 4000s > staleness_threshold (3600s) -> STALE
+    // Secondary elapsed = 5120 - 5120 = 0s <= 3600s -> FRESH
+    // Should fallback to secondary price (250)
+    assert_eq!(setup.client.consult(&60), 250);
+}
+
+#[test]
+fn consult_fails_when_both_primary_and_secondary_are_stale() {
+    let setup = setup_dual_oracle();
+
+    // Primary written at t = 1000..1120
+    set_time(&setup.env, 1_000);
+    let _ = setup.client.observe(&100, &1_000);
+    set_time(&setup.env, 1_060);
+    let _ = setup.client.observe(&100, &1_060);
+    set_time(&setup.env, 1_120);
+    let _ = setup.client.observe(&100, &1_120);
+
+    // Secondary also written at t = 1000..1120
+    let _ = setup.secondary_client.observe(&100, &1_000);
+    let _ = setup.secondary_client.observe(&100, &1_060);
+    let _ = setup.secondary_client.observe(&100, &1_120);
+
+    // Advance ledger clock to 10000 (> 3600s elapsed for both)
+    set_time(&setup.env, 10_000);
+
+    assert_eq!(setup.client.try_consult(&60), Err(Ok(Error::PrimaryStale)));
+}
+
+#[test]
+fn consult_without_secondary_uses_primary_if_fresh() {
+    let setup = setup();
+    seed_observations(&setup);
+
+    // Ledger clock at 1120 (same as latest observation)
+    set_time(&setup.env, 1_120);
+    assert_eq!(setup.client.consult(&60), 200);
+}
+
+#[test]
+fn consult_without_secondary_fails_if_primary_stale() {
+    let setup = setup();
+    seed_observations(&setup);
+
+    // Advance clock past staleness limit
+    set_time(&setup.env, 10_000);
+    assert_eq!(setup.client.try_consult(&60), Err(Ok(Error::PrimaryStale)));
+}
+
+#[test]
+fn consult_with_zero_window_returns_latest_spot_consensus() {
+    let setup = setup_dual_oracle();
+
+    set_time(&setup.env, 1_000);
+    let _ = setup.client.observe(&300, &1_000);
+    let _ = setup.secondary_client.observe(&310, &1_000);
+
+    // Divergence: (310 - 300) * 10_000 / 300 = 333 bps <= 500 bps
+    // Spot consensus: (300 + 310) / 2 = 305
+    assert_eq!(setup.client.consult(&0), 305);
 }
